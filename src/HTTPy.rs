@@ -3,7 +3,7 @@ use std::fs::File;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::collections::HashMap;
 use std::string::String;
-use tokio::{task, net::TcpListener, net::TcpStream};
+use tokio::{task, net::TcpListener, net::TcpStream, io};
 use std::io::prelude::*;
 
 pub struct HttpServer {
@@ -83,7 +83,7 @@ async fn client(client: TcpStream, time: i32, rqml: usize, get: HashMap<String, 
     let mut raw = [0; 1024];
     loop {
         match client.readable().await {
-            Ok(_) => {println!("Ok!")}
+            Ok(_) => {}
             Err(e) => {println!("{e}");}
         }
         match client.try_read(& mut raw) {
@@ -99,22 +99,41 @@ async fn client(client: TcpStream, time: i32, rqml: usize, get: HashMap<String, 
                     break;
                 }
             }
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                continue;
+            }
             Err(e) => {
                 println!("{e}");
-                client.try_write("HTTP/1.1 404 NOT FOUND\r\n\r\n".as_bytes()).unwrap();
                 return;
             }
         }
     }
-    println!("here?");
-    client.writable().await;
-    if &buf[..3] == "GET" {
-        let path = &buf[buf.find(" ").unwrap() + 1 .. buf[buf.find(" ").unwrap() + 1 ..].find(" ").unwrap() + buf.find(" ").unwrap() + 1];
-        if !get.contains_key(path) {
-            client.try_write("HTTP/1.1 404 NOT FOUND\r\n\r\n".as_bytes()).unwrap();
-            return;
+    loop {
+        match client.writable().await {
+            Ok(_) => {}
+            Err(e) => {println!("{e}");}
         }
-        client.try_write(get[path]("".to_owned()).as_bytes()).unwrap();
+        if &buf[..3] == "GET" {
+            let path = &buf[buf.find(" ").unwrap() + 1 .. buf[buf.find(" ").unwrap() + 1 ..].find(" ").unwrap() + buf.find(" ").unwrap() + 1];
+            if !get.contains_key(path) {
+                match client.try_write("HTTP/1.1 404 NOT FOUND\r\n\r\n".as_bytes()) {
+                    Ok(_) => {return;}
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {continue;}
+                    Err(e) => {
+                        println!("{e}");
+                        return;
+                    }
+                }
+            }
+            match client.try_write(get[path]("".to_owned()).as_bytes()) {
+                Ok(_) => {return;}
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {continue;}
+                Err(e) => {
+                    println!("{e}");
+                    return;
+                }
+            }
+        }
     }
 }
 
