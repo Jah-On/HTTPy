@@ -107,8 +107,6 @@ async fn client(client: TcpStream, time: i32, rqml: usize, get: HashMap<String, 
                 return;
             }
         }
-    }
-    loop {
         match client.writable().await {
             Ok(_) => {}
             Err(e) => {println!("{e}");}
