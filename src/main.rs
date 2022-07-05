@@ -8,5 +8,5 @@ async fn main() {
 }
 
 pub fn index(data: String) -> String {
-    return HTTPy::file("/var/www/html/index.html");
+    return HTTPy::file("./index.html");
 }
