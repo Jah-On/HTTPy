@@ -1,5 +1,5 @@
 use std::env;
-use std::fs::File;
+use std::fs::{File, read_dir};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::collections::HashMap;
 use std::string::String;
@@ -17,7 +17,7 @@ pub struct HttpServer {
     fail:  i32,                         // Allowed fails before blocked -- FFI
     blkd:  Vec<IpAddr>,                 // Blocked addresses -- FFI
     flcnt: HashMap<IpAddr, i32>,        // Tally of failed/invalid requests for each IP
-    get: HashMap<String, fn(String) -> String>, // Map of get functions
+    get: HashMap<String, (fn(&str) -> String, String)>, // Map of get functions
 }
 
 impl HttpServer {
@@ -58,82 +58,98 @@ impl HttpServer {
     pub async fn run(&mut self) {
         self.state = true;
         while self.state {
-            let stream = self.sock.accept().await;
-            match stream {
-                Ok((stream, addr)) => {
-                    // client(stream, self.rqml.clone(), self.get.clone());
-                    task::spawn(
-                        client(stream, self.time.clone(), self.rqml.clone(), self.get.clone())
-                    );
-                }
-                Err(e) => { println!("Connection failed!"); }
-            }
+            task::spawn(
+                client(self.sock.accept().await.unwrap().0, self.time.clone(), self.rqml.clone(), self.get.clone())
+            );
         }
     }
     pub fn is_alive(&mut self) -> bool {
         return self.state.clone();
     }
-    pub fn add_get(&mut self, path: &str, fn_: fn(String) -> String) {
-        self.get.insert(String::from(path), fn_);
+    pub fn add_get(&mut self, path: &str, fn_: fn(&str) -> String) {
+        self.get.insert(String::from(path), (fn_, "".to_owned()));
+    }
+    pub fn handle_all_statics(&mut self){
+        for _p in read_dir(&self.root).unwrap(){
+            let path = _p.unwrap();
+            let path_p = path.path();
+            let path_s = path_p.to_str().unwrap();
+            let mut path_r = String::new();
+            path_r = String::from(path_s)[self.root.len() - 1..].to_owned();
+            if path.file_type().unwrap().is_dir() {
+                self.add_dir(path_s);
+            }
+            else if (path_r == "/index.html") || (path_r == "/index.php") {
+                self.get.insert(String::from("/"), (|path: &str| -> String {return file(path);}, String::from(path_s)));
+            } else {
+                self.get.insert(path_r, (|path: &str| -> String {return file(path);}, String::from(path_s)));
+            }
+        }
+        for elem in self.get.keys() {
+            println!("{}", elem)
+        }
+    }
+    fn add_dir(&mut self, dir: &str){
+        for _p in read_dir(dir).unwrap(){
+            let path = _p.unwrap();
+            let path_p = path.path();
+            let path_s = path_p.to_str().unwrap();
+            let mut path_r = String::new();
+            path_r = String::from(path_s)[self.root.len() - 1..].to_owned();
+            if path.file_type().unwrap().is_dir() {
+                self.add_dir(path_s);
+            } else {
+                self.get.insert(path_r, (|path: &str| -> String {return file(path);}, String::from(path_s)));
+            }
+        }
     }
 }
 
-async fn client(client: TcpStream, time: i32, rqml: usize, get: HashMap<String, fn(String) -> String>){
-    let mut buf = String::new();
-    let mut raw = [0; 1024];
-    loop {
-        match client.readable().await {
-            Ok(_) => {}
-            Err(e) => {println!("{e}");}
-        }
-        match client.try_read(& mut raw) {
-            Ok(_) => {
-                if raw.len() == 0 {
-                    break;
-                }
-                else {
-                    buf += &String::from_utf8_lossy(&raw);
-                }
-                if buf.len() >= rqml {
-                    buf = buf[..rqml].to_owned();
-                    break;
-                }
-            }
-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                continue;
-            }
-            Err(e) => {
-                println!("{e}");
-                return;
-            }
-        }
+async fn client(client: TcpStream, time: i32, rqml: usize, get: HashMap<String, (fn(&str) -> String, String)>){
+    let mut buf_r: Vec<u8> = vec![];
+    let mut raw = [0xFF; 1024];
+    let mut chunk = 0;
+    let end = (rqml as f32 / 1024.0).ceil() as i32;
+    match client.readable().await {
+        Ok(_) => {}
+        Err(_) => {return;}
     }
-    loop {
-        match client.writable().await {
+    'outer: while chunk < end {
+        match client.try_read(& mut raw){
             Ok(_) => {}
-            Err(e) => {println!("{e}");}
+            Err(_) => {}
         }
-        if &buf[..3] == "GET" {
-            let path = &buf[buf.find(" ").unwrap() + 1 .. buf[buf.find(" ").unwrap() + 1 ..].find(" ").unwrap() + buf.find(" ").unwrap() + 1];
-            if !get.contains_key(path) {
-                match client.try_write("HTTP/1.1 404 NOT FOUND\r\n\r\n".as_bytes()) {
-                    Ok(_) => {return;}
-                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {continue;}
-                    Err(e) => {
-                        println!("{e}");
-                        return;
-                    }
-                }
-            }
-            match client.try_write(get[path]("".to_owned()).as_bytes()) {
-                Ok(_) => {return;}
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {continue;}
-                Err(e) => {
-                    println!("{e}");
-                    return;
-                }
+        if raw[0] == 0xFF {
+            break;
+        }
+        for pos in 0 .. 1024 {
+            if raw[pos] == 0xFF {
+                buf_r.extend_from_slice(&raw[0..pos]);
+                break 'outer;
+            } else if pos == 1023 {
+                buf_r.extend_from_slice(&raw);
             }
         }
+        raw.fill(0xFF);
+        chunk += 1;
+    }
+    let buf = String::from_utf8_lossy(&buf_r);
+    match client.writable().await {
+        Ok(_) => {}
+        Err(_) => {return;}
+    }
+    if buf.len() < 3 {
+        client.try_write(b"HTTP/1.1 404 NOT FOUND\r\n\r\n").expect("");
+        return;
+    }
+    if &buf[..3] == "GET" {
+        let path = &buf[4 .. buf.find(" HTTP").unwrap()];
+        println!("{}", path);
+        if !get.contains_key(path) {
+            client.try_write(b"HTTP/1.1 404 NOT FOUND\r\n\r\n").expect("");
+            return;
+        }
+        client.try_write(get[path].0(&get[path].1).as_bytes()).unwrap();
     }
 }
 
